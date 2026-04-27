@@ -14,7 +14,7 @@ import sys
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
-from .sessions import TORII_SESSION, DASHBOARD_NAME, find_claude_sessions, get_torii_session, new_claude_window, switch_to_window
+from .sessions import TORII_SESSION, DASHBOARD_NAME, find_claude_sessions, get_torii_session, load_dashboard, new_claude_window, switch_to_window
 from .monitor import STATUS_FILE
 
 try:
@@ -26,6 +26,7 @@ except Exception:
 _NEXT_WAITING_SCRIPT = Path("/tmp/torii_next_waiting.sh")
 _PREV_WAITING_SCRIPT = Path("/tmp/torii_prev_waiting.sh")
 _STATUS_BAR_SCRIPT = Path("/tmp/torii_status.sh")
+_TITLE_SCRIPT = Path("/tmp/torii_title.sh")
 
 # Shared Python logic embedded into both jump scripts.
 _JUMP_LOGIC = f"""\
@@ -39,10 +40,10 @@ except Exception:
     subprocess.run(["tmux", "display-message", "Torii: status file not found"])
     raise SystemExit
 
-indices = d.get("waiting_indices", [])
+indices = d.get("all_indices", [])
 
 if not indices:
-    subprocess.run(["tmux", "display-message", "No sessions waiting for input"])
+    subprocess.run(["tmux", "display-message", "No sessions open"])
     raise SystemExit
 
 # Find which window is currently active so we can cycle relative to it.
@@ -97,6 +98,31 @@ EOF
 """)
     _STATUS_BAR_SCRIPT.chmod(0o755)
 
+    _TITLE_SCRIPT.write_text(f"""\
+#!/bin/sh
+# Emit a terminal tab title with live session counts.
+python3 - <<'EOF'
+import json
+try:
+    d = json.load(open("{STATUS_FILE}"))
+    t = d.get("total", 0)
+    working = d.get("working", 0)
+    waiting = d.get("waiting", 0)
+    if t == 0:
+        print("Torii")
+    else:
+        parts = [f"{{t}} session{{'s' if t != 1 else ''}}"]
+        if working:
+            parts.append(f"{{working}} working")
+        if waiting:
+            parts.append(f"{{waiting}} waiting for input")
+        print("Torii (" + ", ".join(parts) + ")")
+except Exception:
+    print("Torii")
+EOF
+""")
+    _TITLE_SCRIPT.chmod(0o755)
+
 
 def _register_keybindings() -> None:
     """Register all Torii-specific tmux keybindings and configure the status bar."""
@@ -141,6 +167,14 @@ def _register_keybindings() -> None:
         ["tmux", "set-option", "-g", "status-interval", "2"],
         ["tmux", "set-option", "-g", "status-right-length", "60"],
         ["tmux", "set-option", "-g", "status-right", f"#({_STATUS_BAR_SCRIPT})  "],
+        # Mouse scrolling: auto-enters copy mode in Claude windows; Textual handles
+        # its own mouse events via escape sequences so this doesn't interfere.
+        ["tmux", "set-option", "-g", "mouse", "on"],
+        # Keep enough scrollback for long Claude responses.
+        ["tmux", "set-option", "-g", "history-limit", "50000"],
+        # Terminal tab title: show live Torii session counts.
+        ["tmux", "set-option", "-g", "set-titles", "on"],
+        ["tmux", "set-option", "-g", "set-titles-string", f"#({_TITLE_SCRIPT})"],
     ]
     for cmd in cmds:
         subprocess.run(cmd, check=False)
@@ -192,6 +226,47 @@ def _resolve_session_intent(
             return (None, None)
         else:
             print("  Please enter R, N, or S.")
+
+
+def _prompt_resume_dashboard(data: dict) -> bool:
+    """Ask user (in their terminal) whether to recreate a saved dashboard."""
+    sessions = data.get("sessions", [])
+    saved_at = data.get("saved_at", "unknown time")
+    print(f"\nTorii ⛩  — found a saved dashboard from {saved_at}")
+    print(f"  {len(sessions)} session(s):")
+    for s in sessions:
+        cwd = s.get("cwd", "?")
+        name = s.get("name", "?")
+        marker = "" if (cwd and Path(cwd).is_dir()) else "  [directory missing — will skip]"
+        print(f"    · {name}  ({cwd}){marker}")
+    print()
+    while True:
+        try:
+            raw = input("  [R]esume saved dashboard  [N]ew session: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return False
+        if raw in ("r", "resume", ""):
+            return True
+        elif raw in ("n", "new"):
+            return False
+        else:
+            print("  Please enter R or N.")
+
+
+def _recreate_dashboard_sessions(data: dict) -> None:
+    """Re-open all saved Claude windows inside the running tmux session."""
+    session = get_torii_session()
+    if session is None:
+        return
+    for entry in data.get("sessions", []):
+        name = entry.get("name", "")
+        cwd = entry.get("cwd")
+        if not cwd or not Path(cwd).is_dir():
+            continue
+        existing = find_claude_sessions(cwd)
+        resume_id = existing[0]["id"] if existing else None
+        new_claude_window(session, name, cwd, resume_id=resume_id)
 
 
 def _ensure_dashboard() -> None:
@@ -260,6 +335,8 @@ def _parse_args() -> argparse.Namespace:
     # Internal: carries the resolved session ID through the tmux bootstrap so
     # _resolve_session_intent isn't called a second time inside the session.
     parser.add_argument("--resume-id", dest="resume_id", help=argparse.SUPPRESS)
+    # Internal: signals the inner path to recreate all windows from the saved dashboard.
+    parser.add_argument("--resume-dashboard", action="store_true", dest="resume_dashboard", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -294,6 +371,15 @@ def main() -> None:
             subprocess.run(["tmux", "kill-session", "-t", TORII_SESSION], check=False)
             session_exists = False
 
+        # Prompt to resume saved dashboard when: no dir given, Torii not running,
+        # and not currently inside a Claude project directory.
+        resume_dashboard = False
+        if not args.directory and not session_exists and not args.resume_id:
+            if not find_claude_sessions(str(Path.cwd())):
+                saved = load_dashboard()
+                if saved:
+                    resume_dashboard = _prompt_resume_dashboard(saved)
+
         if session_exists:
             # Re-register bindings (picks up any changes from upgrades) then attach.
             _write_helper_scripts()
@@ -317,6 +403,8 @@ def main() -> None:
                 extra.append(target_dir)
             if resume_id:
                 extra += ["--resume-id", resume_id]
+            if resume_dashboard:
+                extra.append("--resume-dashboard")
 
             torii_cmd = shutil.which("torii")
             if torii_cmd:
@@ -347,6 +435,11 @@ def main() -> None:
                 resume_id=args.resume_id,
             )
             switch_to_window(window)
+
+    if args.resume_dashboard:
+        saved = load_dashboard()
+        if saved:
+            _recreate_dashboard_sessions(saved)
 
     from .app import ToriiApp
     ToriiApp().run()

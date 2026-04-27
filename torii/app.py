@@ -14,12 +14,14 @@ from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, 
 
 from .monitor import Monitor
 from .sessions import (
+    DASHBOARD_SAVE_FILE,
     delete_window,
     find_claude_sessions,
     get_torii_session,
     list_claude_windows,
     new_claude_window,
     refresh_keybindings,
+    save_dashboard,
     switch_to_window,
 )
 
@@ -137,6 +139,43 @@ class NewSessionScreen(ModalScreen):
 
 
 # ---------------------------------------------------------------------------
+# Save-dashboard modal
+# ---------------------------------------------------------------------------
+
+class SaveDashboardScreen(ModalScreen):
+    CSS = """
+    SaveDashboardScreen { align: center middle; }
+    #save-dialog {
+        width: 64; height: auto;
+        border: thick $warning; background: $surface; padding: 1 2;
+    }
+    #save-title { text-style: bold; margin-bottom: 1; }
+    #save-info { color: $text-muted; margin-bottom: 1; }
+    #save-buttons { margin-top: 1; height: auto; align: right middle; }
+    #save-buttons Button { margin-left: 1; }
+    """
+
+    def __init__(self, window_count: int) -> None:
+        super().__init__()
+        self._window_count = window_count
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="save-dialog"):
+            yield Label("Detach from Torii", id="save-title")
+            yield Static(
+                f"Save {self._window_count} session(s) to disk for later resume?",
+                id="save-info",
+            )
+            with Horizontal(id="save-buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Detach without saving", id="detach-nosave", variant="error")
+                yield Button("Save & Detach", id="save-detach", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id)  # "cancel" | "detach-nosave" | "save-detach"
+
+
+# ---------------------------------------------------------------------------
 # Main app
 # ---------------------------------------------------------------------------
 
@@ -172,7 +211,7 @@ class ToriiApp(App):
         super().__init__()
         self.monitor = Monitor()
         self._ordered_keys: list[str] = []
-        self._last_summary: dict[str, str] = {}
+        self._last_summary: dict[str, str] | None = None
 
     # ------------------------------------------------------------------
     # Composition
@@ -282,21 +321,38 @@ class ToriiApp(App):
         self.push_screen(NewSessionScreen(), handle)
 
     def action_quit(self) -> None:
-        """Detach from the tmux session, leaving ToriiApp alive in window 0.
+        """Prompt to save the dashboard, then detach from tmux.
 
-        By NOT calling self.exit(), the dashboard process keeps running while
-        the user is away. Re-running `torii` re-attaches instantly without
-        needing to restart ToriiApp. The session (and all Claude windows)
-        continues in the background.
+        ToriiApp stays alive in window 0 — re-running `torii` re-attaches
+        instantly. The save file lets the user restore the session layout
+        after the tmux session is gone.
         """
-        subprocess.run(["tmux", "detach-client"], check=False)
+        session = get_torii_session()
+        windows = list_claude_windows(session) if session else []
+
+        if not windows:
+            subprocess.run(["tmux", "detach-client"], check=False)
+            return
+
+        def handle(result: str | None) -> None:
+            if result in (None, "cancel"):
+                return
+            if result == "save-detach":
+                try:
+                    save_dashboard(windows)
+                except Exception as exc:
+                    self.notify(f"Save failed: {exc}", severity="error")
+                    return
+            subprocess.run(["tmux", "detach-client"], check=False)
+
+        self.push_screen(SaveDashboardScreen(len(windows)), handle)
 
     def action_delete_session(self) -> None:
         window = self._selected_window()
         if window is None:
             return
         delete_window(window)
-        self._last_summary = {}
+        self._last_summary = None
         self.action_refresh()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:

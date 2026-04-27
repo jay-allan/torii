@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 import time
@@ -17,6 +18,18 @@ _WAITING_INDICATORS = ("╭", "│ >", "│>")
 
 # Characters that indicate a line is purely decorative (box borders, etc.)
 _BOX_CHARS = frozenset("╭╰│╮╯─┌└┐┘├┤┬┴┼━═║╔╗╚╝╠╣╦╩╬▶▷◀◁ ")
+
+# Claude Code keyboard-shortcut hint lines that appear at the bottom of the
+# terminal and should never be shown as "last activity" in the dashboard.
+_UI_CHROME = re.compile(
+    r"(?:"
+    r"\besc\s+to\s+\w+"         # "esc to cancel / exit / interrupt"
+    r"|auto-accept\s+edits"     # "auto-accept edits on/off"
+    r"|\bshift\+tab\b"          # "shift+tab to interrupt / for multi-line"
+    r"|\bfor\s+keybindings?\b"  # "? for keybindings"
+    r")",
+    re.IGNORECASE,
+)
 
 # Shared status file read by the tmux status bar script and the jump-to-waiting binding.
 STATUS_FILE = Path("/tmp/torii-status.json")
@@ -49,6 +62,8 @@ def _extract_last_activity(text: str) -> str:
             continue
         if stripped in (">", "❯", "$", "%", "#", "▶"):
             continue
+        if _UI_CHROME.search(stripped):
+            continue
         return stripped[:60]
     return ""
 
@@ -62,23 +77,32 @@ def _write_status(result: dict) -> None:
         (k for k, v in result.items() if v["status"] == "waiting"),
         key=int,
     )
+    all_indices = sorted(result.keys(), key=int)
+    working_count = sum(1 for v in result.values() if v["status"] == "working")
     try:
         STATUS_FILE.write_text(json.dumps({
             "total": len(result),
             "waiting": len(waiting_indices),
+            "working": working_count,
             "waiting_indices": waiting_indices,
+            "all_indices": all_indices,
         }))
     except OSError:
         pass
 
 
-def _notify(session_name: str, window_index: str) -> None:
+def _notify(session_name: str, window_index: str, status: str) -> None:
     """Fire a desktop notification in a background thread.
 
-    If the user clicks the 'Switch' action, immediately focus that tmux window.
-    Uses notify-send --action which implies --wait; runs in a daemon thread so
-    it never blocks the monitor poll loop.
+    Tries notify-send --action (v0.8+) for click-to-switch; falls back to a
+    plain notification if that flag is unsupported or the call fails.
     """
+    body = (
+        f"'{session_name}' is waiting for your input"
+        if status == "waiting"
+        else f"'{session_name}' finished"
+    )
+
     def _send() -> None:
         result = subprocess.run(
             [
@@ -87,12 +111,24 @@ def _notify(session_name: str, window_index: str) -> None:
                 "--icon=utilities-terminal",
                 "--urgency=normal",
                 "Torii ⛩",
-                f"'{session_name}' is waiting for your input",
+                body,
             ],
             capture_output=True,
             text=True,
         )
-        if result.stdout.strip() == "switch":
+        if result.returncode != 0:
+            # --action not supported; fall back to a plain notification.
+            subprocess.run(
+                [
+                    "notify-send",
+                    "--icon=utilities-terminal",
+                    "--urgency=normal",
+                    "Torii ⛩",
+                    body,
+                ],
+                check=False,
+            )
+        elif result.stdout.strip() == "switch":
             subprocess.run(
                 ["tmux", "select-window", "-t", f"{TORII_SESSION}:{window_index}"],
                 check=False,
@@ -134,9 +170,11 @@ class Monitor:
             else:
                 new_status = "idle"
 
-            # Fire notification on transition → waiting
+            # Fire notification on transition → waiting, or working → idle
             if new_status == "waiting" and state.status != "waiting":
-                _notify(window.window_name, key)
+                _notify(window.window_name, key, "waiting")
+            elif new_status == "idle" and state.status == "working":
+                _notify(window.window_name, key, "idle")
 
             if text != state.last_text:
                 state.last_text = text

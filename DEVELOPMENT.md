@@ -11,15 +11,20 @@ inside a tmux session (`$TMUX` environment variable):
 
 **Outer path** (user's shell, no tmux):
 1. Optionally prompt about existing Claude sessions (resume / new / skip)
-2. If a `torii` tmux session already exists: re-register keybindings, optionally create
+2. If no directory given, no tmux session exists, and the cwd is not a Claude project
+   directory: check for a saved dashboard (`~/.config/torii/last_dashboard.json`) and
+   offer to restore it
+3. If a `torii` tmux session already exists: re-register keybindings, optionally create
    a new Claude window, then `os.execvp` into `tmux attach-session -t torii:0`
-3. If no session exists: `os.execvp` into `tmux new-session` which re-runs `torii` inside
+4. If no session exists: `os.execvp` into `tmux new-session` which re-runs `torii` inside,
+   forwarding `--resume-dashboard` if the user accepted the restore prompt
 
 **Inner path** (inside tmux, after bootstrap):
 1. Write helper scripts to `/tmp/`
 2. Register all keybindings and configure the tmux status bar
 3. Optionally open a Claude window if a directory argument was given
-4. Launch `ToriiApp` (Textual)
+4. If `--resume-dashboard` is set: recreate all saved sessions from the save file
+5. Launch `ToriiApp` (Textual)
 
 The outer path always calls `os.execvp` — it replaces itself with the tmux process so
 there is no lingering wrapper.
@@ -53,7 +58,8 @@ is enforced by two mechanisms:
 
 ### Why ToriiApp never calls `self.exit()`
 
-`q` in the dashboard calls `action_quit`, which only runs `tmux detach-client`. It does
+`q` in the dashboard shows a save prompt (`SaveDashboardScreen`) and, after the user
+chooses Save & Detach or Detach without saving, calls `tmux detach-client`. It does
 **not** call `self.exit()`. This is a deliberate design decision:
 
 - ToriiApp stays alive in window 0 at all times
@@ -67,23 +73,54 @@ a shell prompt, and `_ensure_dashboard()` would need to restart ToriiApp via
 
 ---
 
+### Dashboard save / restore
+
+**Save file**: `~/.config/torii/last_dashboard.json`
+
+```json
+{
+  "saved_at": "2026-04-17T14:30:00Z",
+  "sessions": [
+    {"name": "auth-fix", "cwd": "/home/jay/Dev/myproject"},
+    {"name": "api-refactor", "cwd": "/home/jay/Dev/api"}
+  ]
+}
+```
+
+**Save path** (`sessions.py`):
+- `save_dashboard(windows)` — iterates `list_claude_windows()`, reads `window_name` and
+  `active_pane.pane_current_path` for each window, writes the file
+- Called from `ToriiApp.action_quit()` when the user chooses "Save & Detach"
+
+**Restore path** (`main.py`):
+- `load_dashboard()` — reads and validates the file; returns `None` if missing/malformed
+- `_prompt_resume_dashboard(data)` — CLI prompt shown on the outer path
+- `_recreate_dashboard_sessions(data)` — called on the inner path when `--resume-dashboard`
+  is set; for each entry calls `find_claude_sessions(cwd)` to get the most recent resume
+  ID, then `new_claude_window()`
+- Sessions whose `cwd` no longer exists are silently skipped
+
+---
+
 ### Keybindings and the status bar
 
 All tmux keybindings are registered via `_register_keybindings()` (called on the inner
 path) and `refresh_keybindings()` (called from `ToriiApp.on_mount` every time the
 dashboard starts, as a safety net).
 
-The `Ctrl+→` / `Ctrl+←` jump bindings call small Python scripts written to `/tmp/`:
+Helper scripts written to `/tmp/` on every invocation:
 
-- `/tmp/torii_next_waiting.sh`
-- `/tmp/torii_prev_waiting.sh`
-- `/tmp/torii_status.sh` (status bar)
+- `/tmp/torii_next_waiting.sh` — jump to next session (`Ctrl+→`), cycles all sessions
+- `/tmp/torii_prev_waiting.sh` — jump to previous session (`Ctrl+←`), cycles all sessions
+- `/tmp/torii_status.sh` — one-line summary for the tmux status bar
+- `/tmp/torii_title.sh` — terminal tab title string (e.g. `Torii (3 sessions, 1 working)`)
 
-These scripts read `/tmp/torii_status.json` (written by `monitor.py`) to find which
-windows are waiting. They are regenerated on every `torii` invocation.
+The `Ctrl+→` / `Ctrl+←` bindings cycle through **all** open sessions (not just waiting
+ones), using `all_indices` from the status file.
 
-The tmux status bar is set to a 2-second refresh interval, showing a one-line summary
-from `torii_status.sh`.
+The tmux status bar is set to a 2-second refresh interval. The terminal tab title
+(`set-titles-string`) is also driven by `/tmp/torii_title.sh` via `#()` substitution and
+updates on the same interval.
 
 ---
 
@@ -98,10 +135,21 @@ window it:
    - **Waiting**: Claude's input prompt box (`╭`) visible in the last few lines
    - **Working**: captured text differs from the previous poll
    - **Idle**: text unchanged, no prompt visible
-4. Fires `notify-send` on any `→ waiting` transition
+4. Fires a desktop notification on:
+   - any state → **Waiting** ("waiting for your input")
+   - **Working** → **Idle** ("finished")
 
-The `Monitor` class also writes a JSON file (`/tmp/torii_status.json`) containing
-`total`, `waiting`, and `waiting_indices` for the helper scripts to consume.
+The `Monitor` class writes a JSON file (`/tmp/torii-status.json`) containing `total`,
+`waiting`, `working`, `waiting_indices`, and `all_indices` for the helper scripts to
+consume.
+
+### Desktop notification fallback
+
+`_notify()` first tries `notify-send --action` (v0.8+), which blocks until the
+notification is dismissed and returns `"switch"` on the action button. If the call fails
+(non-zero exit — older `notify-send` or daemon without action support), it retries with a
+plain `notify-send` call without `--action`. This ensures notifications work on all
+common Ubuntu setups regardless of `notify-send` version.
 
 ---
 
@@ -111,8 +159,21 @@ The `Monitor` class also writes a JSON file (`/tmp/torii_status.json`) containin
 `~/.claude/projects/<encoded-path>/` for `.jsonl` files. Claude encodes project paths
 by replacing every `/` with `-`. Sessions are sorted by `mtime`, newest first.
 
-This is used both in the CLI (`_resolve_session_intent`) and in the new-session modal
-(`NewSessionScreen._refresh_resume_option`) to offer resume options to the user.
+This is used in the CLI (`_resolve_session_intent`), the new-session modal
+(`NewSessionScreen._refresh_resume_option`), and dashboard restore
+(`_recreate_dashboard_sessions`).
+
+---
+
+### Mouse and scrollback
+
+`_register_keybindings()` sets `mouse on` globally. This lets users scroll up in any
+Claude window — tmux automatically enters copy mode on scroll, allowing full access to
+the pane's history. Textual in window 0 uses its own mouse escape sequences and is
+unaffected by this setting.
+
+The history limit is set to 50 000 lines (`history-limit 50000`) to accommodate long
+Claude responses that would otherwise overflow the default 2 000-line buffer.
 
 ---
 
@@ -153,10 +214,15 @@ next `torii` invocation regenerates them).
 
 ### `notify-send --action` click-to-focus
 
-Desktop notification click-through (switching to the waiting window on click) uses
-`notify-send --action`. This requires `notify-send` v0.8+ and a notification daemon that
-supports actions (e.g., dunst, GNOME Shell). On systems without action support the
-notification still fires but clicking it does nothing.
+Desktop notification click-through uses `notify-send --action`, which requires
+`notify-send` v0.8+ and a notification daemon that supports actions (e.g., dunst, GNOME
+Shell). On systems without action support, `_notify()` falls back to a plain
+`notify-send` call — the notification still appears but clicking it does nothing.
+
+### `set-titles-string` update cadence
+
+The terminal tab title is refreshed by tmux on every `status-interval` tick (2 seconds).
+There is an inherent lag between a session changing state and the title reflecting it.
 
 ---
 
@@ -190,6 +256,15 @@ Any code path that calls `self.exit()` breaks the "ToriiApp lives forever in win
 invariant and will eventually produce a shell prompt instead of a dashboard on re-attach.
 If you add any shutdown logic, ensure it only calls `tmux detach-client` and leaves the
 Textual app running.
+
+### `_last_summary` sentinel and the empty-table edge case
+
+`ToriiApp._last_summary` is initialised to `None` (not `{}`). The `action_refresh()`
+method skips a full table redraw when `new_summary == _last_summary`. If this were
+initialised to `{}`, deleting the last session would set `_last_summary = {}`, the next
+poll would return `{}`, and the early-return would fire — leaving the deleted row visible
+until the next non-empty poll. Using `None` as the sentinel avoids this: `{} != None` so
+the redraw always runs after a deletion.
 
 ### Textual version compatibility
 

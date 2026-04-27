@@ -1,6 +1,7 @@
 """tmux session and window management via libtmux."""
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from datetime import datetime
@@ -11,6 +12,7 @@ import libtmux
 
 TORII_SESSION = "torii"
 DASHBOARD_NAME = "dashboard"
+DASHBOARD_SAVE_FILE = Path.home() / ".config" / "torii" / "last_dashboard.json"
 
 _ANSI_ESCAPE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -59,6 +61,39 @@ def find_claude_sessions(cwd: Optional[str] = None) -> list[dict]:
         })
 
     return sorted(entries, key=lambda e: e["mtime"], reverse=True)
+
+
+def save_dashboard(windows: list) -> Path:
+    """Write current Claude windows to the dashboard save file."""
+    if not windows:
+        raise ValueError("No Claude windows to save.")
+    sessions = []
+    for w in windows:
+        pane = w.active_pane
+        sessions.append({
+            "name": w.window_name,
+            "cwd": pane.pane_current_path if pane else None,
+        })
+    payload = {
+        "saved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "sessions": sessions,
+    }
+    DASHBOARD_SAVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DASHBOARD_SAVE_FILE.write_text(json.dumps(payload, indent=2))
+    return DASHBOARD_SAVE_FILE
+
+
+def load_dashboard() -> dict | None:
+    """Return saved dashboard dict, or None if missing/malformed."""
+    if not DASHBOARD_SAVE_FILE.exists():
+        return None
+    try:
+        data = json.loads(DASHBOARD_SAVE_FILE.read_text())
+        if isinstance(data.get("sessions"), list):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return None
 
 
 def new_claude_window(

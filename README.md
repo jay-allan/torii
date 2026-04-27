@@ -8,7 +8,7 @@
 Torii is a terminal dashboard for Linux that lets you run multiple Claude Code sessions in
 parallel and keep track of them all from a single view. Navigate between sessions with arrow
 keys, switch to them with Enter, and get desktop notifications the moment one of them is
-waiting for your input.
+waiting for your input or finishes a task.
 
 Think of it as the command bridge for your fleet of AI agents.
 
@@ -19,18 +19,26 @@ Think of it as the command bridge for your fleet of AI agents.
 - **Session overview** — see all your Claude Code sessions at a glance: name, status
   (working / waiting / idle), and time of last activity
 - **Keyboard navigation** — arrow keys to select, Enter to jump into that session
-- **Waiting notifications** — desktop notification via `notify-send` the moment Claude
-  asks for your input; clicking the notification switches to that session
+- **Notifications** — desktop notification via `notify-send` when Claude asks for your
+  input (Waiting) or finishes a task on its own (Idle); clicking the notification switches
+  to that session
+- **Save & resume dashboard** — press `q` to be prompted to save your current session
+  layout to disk; the next time you open Torii in a fresh terminal it will offer to restore
+  all sessions automatically
 - **New sessions** — press `n` to open a dialog; session name is optional (defaults to
   the directory name), and Torii detects existing Claude sessions in the target directory
   so you can resume them
 - **Delete sessions** — press `d` to close a session
+- **Mouse scrolling** — scroll up in any Claude window to read back through long responses;
+  tmux copy mode activates automatically
+- **Terminal tab title** — your terminal emulator's tab shows live status:
+  `Torii (3 sessions, 1 working, 2 waiting for input)`
 - **tmux status bar** — shows total session count and how many are waiting, visible from
   every window
 - **tmux-backed** — each session runs in a real tmux window, so they're robust and
   persist even if Torii's dashboard is not in focus
-- **Instant re-attach** — pressing `q` detaches your terminal from the tmux session
-  without stopping anything; running `torii` again re-attaches instantly
+- **Instant re-attach** — sessions keep running when you detach; running `torii` again
+  re-attaches instantly
 
 ---
 
@@ -79,6 +87,9 @@ gets its own window.
 If you run `torii <directory>` and that directory has existing Claude sessions, Torii
 will ask whether to resume the most recent one, start a new one, or skip.
 
+If you run `torii` with no arguments, no existing tmux session, and you are not inside a
+Claude project directory, Torii will check for a saved dashboard and offer to restore it.
+
 ### Keybindings — Dashboard
 
 | Key | Action |
@@ -88,7 +99,7 @@ will ask whether to resume the most recent one, start a new one, or skip.
 | `n` | Create a new Claude session |
 | `d` | Delete selected session |
 | `r` | Refresh manually |
-| `q` | Detach from Torii (sessions keep running in the background) |
+| `q` | Save dashboard prompt, then detach (sessions keep running in the background) |
 
 ### Keybindings — Global (from any window)
 
@@ -96,10 +107,36 @@ will ask whether to resume the most recent one, start a new one, or skip.
 |-----|--------|
 | `Ctrl+T` | Return to the Torii dashboard |
 | `Ctrl+C` | Show popup: send Ctrl+C to Claude, switch to dashboard, or cancel |
-| `Ctrl+→` | Jump to the next session waiting for input (wraps around) |
-| `Ctrl+←` | Jump to the previous session waiting for input (wraps around) |
+| `Ctrl+→` | Jump to the next session (wraps around) |
+| `Ctrl+←` | Jump to the previous session (wraps around) |
 
 Clicking a desktop notification immediately switches to the session that sent it.
+
+---
+
+## Saving and resuming a dashboard
+
+Pressing `q` on the dashboard opens a prompt with three options:
+
+- **Save & Detach** — writes the current session layout (names and working directories)
+  to `~/.config/torii/last_dashboard.json`, then detaches
+- **Detach without saving** — detaches without touching the save file
+- **Cancel** — returns to the dashboard
+
+The next time you run `torii` with no arguments, no existing tmux session, and from a
+directory that is not itself a Claude project, Torii will detect the save file and ask:
+
+```
+Torii ⛩  — found a saved dashboard from 2026-04-17T14:30:00Z
+  2 session(s):
+    · auth-fix  (/home/jay/Dev/myproject)
+    · api-refactor  (/home/jay/Dev/api)
+
+  [R]esume saved dashboard  [N]ew session:
+```
+
+Choosing `R` recreates all sessions (resuming each directory's most recent Claude
+conversation). Sessions whose directories no longer exist are silently skipped.
 
 ---
 
@@ -114,8 +151,9 @@ last 20 lines of terminal output, strips ANSI escape codes, and classifies the s
 | **Working** | Terminal output has changed since the last poll |
 | **Idle** | Output is unchanged and no prompt is visible |
 
-When a session transitions from any other state to **Waiting**, a desktop notification
-fires immediately.
+A desktop notification fires on two transitions:
+- Any state → **Waiting** (Claude needs your input)
+- **Working** → **Idle** (Claude finished a task autonomously)
 
 ---
 
@@ -131,6 +169,6 @@ torii/
 └── torii/
     ├── main.py          # Entry point; bootstraps tmux session
     ├── app.py           # Textual TUI dashboard
-    ├── sessions.py      # libtmux helpers
+    ├── sessions.py      # libtmux helpers (including dashboard save/load)
     └── monitor.py       # Status polling + notifications
 ```
